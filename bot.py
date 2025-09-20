@@ -1,116 +1,121 @@
-# bot.py — نسخة مستقرة: يعرض فقط الأعمدة المطلوبة + مكافحة Flood + اكتشاف عمود اللوحة تلقائياً
-import os, logging, traceback, asyncio
+# bot.py — نسخة خفيفة الذاكرة: بدون pandas، بحث مباشر في Excel باستخدام openpyxl (read_only)
+import os, logging, asyncio, traceback
 from io import BytesIO
-import pandas as pd
+from typing import List, Dict, Optional
+from openpyxl import load_workbook
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 from telegram.error import BadRequest, Forbidden, TimedOut, NetworkError, RetryAfter
 
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 
-# ==== إعداد المسارات والملفات ====
 BASE = os.path.dirname(os.path.abspath(__file__))
-FILES = [
+EXCEL_FILES = [
     os.path.join(BASE, "اكسل ارشيف باجات السيارات 2024.xlsx"),
     os.path.join(BASE, "اكسل سيارات 2025.xlsx"),
 ]
 
-# اسم عمود اللوحة الافتراضي (قد يُستبدل تلقائياً عبر الاكتشاف)
-PLATE_COLUMN = "رقمها"
+PLATE_CANDIDATES = ["رقمها", "رقم اللوحة", "رقم السيارة", "رقم العجلة", "رقم", "الرقم", "لوحة"]
+RESPONSE_COLUMNS = ["الاسم الثلاثي", "العنوان", "الوظيفي", "مكان العمل", "لونها", "رقمها", "تسلسل الباج", "رقم الهاتف"]
 
-# الأعمدة المطلوبة فقط (بالترتيب) — سيتم عرضها فقط
-EXPECTED_COLUMNS_ORDER = [
-    "الاسم الثلاثي", "العنوان", "الوظيفي", "مكان العمل",
-    "لونها", "رقمها", "تسلسل الباج", "رقم الهاتف"
-]
-SHOW_ONLY_EXPECTED = True  # لا تعرض أي أعمدة إضافية
+MAX_LEN = 3900
 
-DATA_DF = None
-MAX_LEN = 3900      # أقل من حد 4096 لتجنب "Message is too long"
-MAX_RESULTS = 1     # نرسل نتيجة واحدة لتقليل الرسائل وتفادي الفلود
-
-# ==== أدوات عامة ====
 def read_token():
-    token_path = os.path.join(BASE, "token.txt")
-    if os.path.exists(token_path):
-        return open(token_path, "r", encoding="utf-8").read().strip()
+    p = os.path.join(BASE, "token.txt")
+    if os.path.exists(p):
+        return open(p, "r", encoding="utf-8").read().strip()
     return os.getenv("TELEGRAM_BOT_TOKEN")
 
-def _normalize_text(s: str) -> str:
-    # إزالة أحرف اتجاه خفية + فراغات + تحويل لـ Upper
-    return str(s).replace("\u200f", "").replace("\u200e", "").strip().upper()
+def norm(s: str) -> str:
+    return str(s).replace("\u200f","").replace("\u200e","").strip().upper()
 
-def _normalize_colname(s: str) -> str:
-    return str(s).replace("\u200f", "").replace("\u200e", "").strip()
+def norm_col(s: str) -> str:
+    return str(s).replace("\u200f","").replace("\u200e","").strip()
 
-def detect_plate_column(cols):
-    """يحاول اكتشاف عمود اللوحة تلقائياً إذا الاسم مختلف."""
-    exact = ["رقمها", "رقم اللوحة", "رقم السيارة", "رقم العجلة"]
-    for k in exact:
-        if k in cols:
-            return k
-    contains = ["رقم", "الرقم", "لوحة", "العجلة", "السيارة"]
-    for c in cols:
-        for k in contains:
-            if k in c:
-                return c
+def detect_plate_col(headers: List[str]) -> Optional[str]:
+    # تطبيع عناوين الأعمدة ومطابقة مرشّحات لوحدة اللوحة
+    headers_n = [norm_col(h) for h in headers]
+    # مطابقات دقيقة أولاً
+    for k in PLATE_CANDIDATES[:4]:
+        if k in headers_n:
+            return headers[headers_n.index(k)]
+    # بعدها يحتوي
+    for i, h in enumerate(headers_n):
+        for k in PLATE_CANDIDATES:
+            if k in h:
+                return headers[i]
     return None
 
-def load_data():
-    """تحميل ودمج ملفات الإكسل + تطبيع الأعمدة والقيم + اكتشاف عمود اللوحة + تمييز المصدر."""
-    dfs = []
-    for f in FILES:
-        if not os.path.exists(f):
-            logging.warning(f"⚠ الملف غير موجود: {f}")
-            continue
-        try:
-            df = pd.read_excel(f, engine="openpyxl")
-            df.columns = [_normalize_colname(c) for c in df.columns]
-            # نضيف عمود "المصدر" لكن لن نعرضه لأننا نظهر فقط الأعمدة المطلوبة
-            df["المصدر"] = os.path.basename(f)
-            dfs.append(df)
-        except Exception as e:
-            logging.exception(f"❌ خطأ بقراءة {f}: {e}")
-    if not dfs:
-        return pd.DataFrame()
+def read_first_sheet_headers(ws) -> List[str]:
+    # يفترض أن الصف الأول هو عناوين الأعمدة
+    for row in ws.iter_rows(min_row=1, max_row=1, values_only=True):
+        return [norm_col(c if c is not None else "") for c in row]
+    return []
 
-    out = pd.concat(dfs, ignore_index=True).fillna("")
-    # اكتشاف عمود اللوحة لو الافتراضي غير موجود
-    global PLATE_COLUMN
-    if PLATE_COLUMN not in out.columns:
-        guess = detect_plate_column(list(out.columns))
-        if guess:
-            PLATE_COLUMN = guess
-            logging.info(f"🔎 اكتشفنا عمود اللوحة: {PLATE_COLUMN}")
-        else:
-            logging.warning(f"⚠ لم نعثر على عمود لوحة مناسب ضمن الأعمدة: {list(out.columns)}")
-
-    if PLATE_COLUMN in out.columns:
-        out[PLATE_COLUMN] = out[PLATE_COLUMN].apply(_normalize_text)
+def build_row_dict(headers: List[str], row_values: List[str]) -> Dict[str, str]:
+    out = {}
+    for h, v in zip(headers, row_values):
+        out[h] = "" if v is None else str(v)
     return out
 
-def format_row(row, preferred_order):
+def format_response(row: Dict[str,str], source_name:str) -> str:
     parts = []
-    # سطر تعريف بسيط
-    if PLATE_COLUMN in row.index:
-        parts.append(f"🔎 نتيجة البحث للرقم: {row[PLATE_COLUMN]}")
+    if "رقمها" in row:
+        parts.append(f"🔎 نتيجة البحث للرقم: {row.get('رقمها','')}")
         parts.append("—" * 10)
-    # نعرض فقط الأعمدة المطلوبة وبنفس الترتيب
-    for col in preferred_order:
-        if col in row.index:
-            val = "" if pd.isna(row[col]) else str(row[col])
-            parts.append(f"{col}: {val}")
-    # لا نعرض أعمدة إضافية إذا SHOW_ONLY_EXPECTED = True
-    if not SHOW_ONLY_EXPECTED:
-        preferred_set = set(preferred_order)
-        for col in row.index:
-            if col not in preferred_set:
-                val = "" if pd.isna(row[col]) else str(row[col])
-                parts.append(f"{col}: {val}")
+    for col in RESPONSE_COLUMNS:
+        if col in row:
+            parts.append(f"{col}: {row.get(col,'')}")
+    # ما نعرض غيرها — فقط الأعمدة المطلوبة
+    # نضيف مصدر السجل كمعلومة مفيدة
+    parts.append(f"المصدر: {source_name}")
     return "\n".join(parts)
 
-# ==== إرسال آمن مع مكافحة Flood ====
-async def safe_send_text(update, text, max_attempts=3):
+def search_plate_once(xlsx_path: str, key: str) -> Optional[Dict[str,str]]:
+    if not os.path.exists(xlsx_path):
+        return None
+    try:
+        wb = load_workbook(xlsx_path, read_only=True, data_only=True)
+        ws = wb.active
+        headers = read_first_sheet_headers(ws)
+        if not headers:
+            wb.close()
+            return None
+        # اكتشاف عمود اللوحة
+        plate_col_name = detect_plate_col(headers)
+        if not plate_col_name:
+            wb.close()
+            return None
+
+        # خرائط: اسم عمود → فهرس
+        headers_map = {headers[i]: i for i in range(len(headers))}
+        plate_idx = headers_map.get(plate_col_name, None)
+        if plate_idx is None:
+            wb.close()
+            return None
+
+        # بحث صفاً صفاً (ذاكرة قليلة)
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            if row is None:
+                continue
+            # حماية من صفوف قصيرة
+            if plate_idx >= len(row):
+                continue
+            val = row[plate_idx]
+            if val is None:
+                continue
+            if norm(str(val)) == key or (key in norm(str(val))):  # مطابق أولاً ثم جزئي
+                # بنى قاموس بالاعمدة كلها ثم نختار المطلوب
+                row_dict = build_row_dict(headers, list(row))
+                wb.close()
+                return row_dict
+        wb.close()
+        return None
+    except Exception as e:
+        logging.exception(f"خطأ أثناء قراءة {xlsx_path}: {e}")
+        return None
+
+async def safe_send_text(update: Update, text: str, max_attempts=3):
     attempt = 0
     while attempt < max_attempts:
         try:
@@ -126,133 +131,67 @@ async def safe_send_text(update, text, max_attempts=3):
     except Exception:
         return None
 
-async def send_in_chunks(update, text, chunk_size=MAX_LEN):
+async def send_in_chunks(update: Update, text: str):
     start, n = 0, len(text)
     while start < n:
-        end = min(start + chunk_size, n)
+        end = min(start + MAX_LEN, n)
         await safe_send_text(update, text[start:end])
-        await asyncio.sleep(0.6)  # تأخير بسيط يقلّل احتمال الفلود
+        await asyncio.sleep(0.6)
         start = end
 
-# ==== أوامر ====
+# أوامر
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global DATA_DF
-    if DATA_DF is None or DATA_DF.empty:
-        DATA_DF = load_data()
-    rows = 0 if DATA_DF is None else len(DATA_DF)
-    await safe_send_text(
-        update,
-        f"هلا! أرسل رقم السيارة (من عمود '{PLATE_COLUMN}').\n"
-        f"عدد السجلات المحمّلة: {rows}\n"
-        f"أوامر: /ping /reload /debug"
-    )
+    await safe_send_text(update, "هلا! أرسل رقم السيارة (من عمود 'رقمها'). أوامر: /ping /debug")
 
 async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_send_text(update, "pong ✅")
 
-async def reload_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global DATA_DF
-    DATA_DF = load_data()
-    await safe_send_text(update, f"تم إعادة تحميل البيانات. السجلات: {len(DATA_DF)}")
-
 async def debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global DATA_DF, PLATE_COLUMN
-    if DATA_DF is None or DATA_DF.empty:
-        DATA_DF = load_data()
-    rows = 0 if DATA_DF is None else len(DATA_DF)
-    cols = [] if DATA_DF is None else list(DATA_DF.columns)
-    has_plate = PLATE_COLUMN in cols
-    txt = [
-        f"Rows: {rows}",
-        f"Plate column used: {PLATE_COLUMN}",
-        f"Has plate column: {has_plate}",
-        "Columns:",
-        *(str(c) for c in cols[:100]),
-    ]
-    out = "\n".join(txt)
-    if len(out) <= MAX_LEN:
-        await safe_send_text(update, out)
-    else:
-        bio = BytesIO(out.encode("utf-8"))
-        bio.name = "debug.txt"
-        try:
-            await update.message.reply_document(bio)
-        except RetryAfter as e:
-            await asyncio.sleep(e.retry_after + 1)
-            await update.message.reply_document(bio)
+    # بس نعرض أسماء الملفات الموجودة على السيرفر
+    existing = [os.path.basename(f) for f in EXCEL_FILES if os.path.exists(f)]
+    msg = ["Files on server:"] + existing
+    await safe_send_text(update, "\n".join(msg) if existing else "ماكو ملفات إكسل على السيرفر.")
 
-# ==== البحث ====
+# استقبال الرسائل (بحث)
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global DATA_DF, PLATE_COLUMN
     try:
         text = (update.message.text or "").strip()
-        logging.info(f"⬅ Received: {text}")
-
         if not text:
             await safe_send_text(update, "اكتب رقم السيارة حتى أبحث عنه.")
             return
+        key = norm(text)
 
-        if DATA_DF is None or DATA_DF.empty:
-            DATA_DF = load_data()
-            if DATA_DF is None or DATA_DF.empty:
-                await safe_send_text(update, "خطأ بتحميل الملفات. تأكد من وجودها بنفس المجلد.")
+        # نبحث ملف ملف — أول نتيجة نوقف
+        for path in EXCEL_FILES:
+            row = search_plate_once(path, key)
+            if row:
+                msg = format_response(row, source_name=os.path.basename(path))
+                if len(msg) > MAX_LEN:
+                    await send_in_chunks(update, msg)
+                else:
+                    await safe_send_text(update, msg)
                 return
 
-        if PLATE_COLUMN not in DATA_DF.columns:
-            await safe_send_text(update, f"خطأ: عمود '{PLATE_COLUMN}' غير موجود. اكتب /debug لمراجعة الأعمدة.")
-            return
-
-        key = _normalize_text(text)
-
-        # مطابق أولاً ثم جزئي
-        matches = DATA_DF[DATA_DF[PLATE_COLUMN] == key].copy()
-        if matches.empty:
-            matches = DATA_DF[DATA_DF[PLATE_COLUMN].str.contains(key, na=False)].copy()
-
-        if matches.empty:
-            await safe_send_text(update, f"ماكو معلومات للسيارة رقم: {text}")
-            return
-
-        matches = matches.drop_duplicates(subset=[PLATE_COLUMN], keep="first").fillna("")
-
-        # نرسل نتيجة واحدة فقط لتفادي الفلود
-        row = matches.iloc[0]
-        msg = format_row(row, EXPECTED_COLUMNS_ORDER)
-        if len(msg) > MAX_LEN:
-            await send_in_chunks(update, msg)
-        else:
-            await safe_send_text(update, msg)
+        await safe_send_text(update, f"ماكو معلومات للسيارة رقم: {text}")
 
     except (BadRequest, Forbidden, TimedOut, NetworkError, RetryAfter) as e:
         logging.error(f"Telegram error: {type(e).__name__}: {e}")
-        detail = f"{type(e).__name__}: {str(e)}"
-        try:
-            await safe_send_text(update, "خطأ إرسال:\n" + detail[:500])
-        except Exception:
-            pass
+        await safe_send_text(update, "خطأ إرسال: جرّب بعد شوي.")
     except Exception as e:
-        tb = traceback.format_exc()
-        logging.error("Unhandled error:\n" + tb)
-        try:
-            await safe_send_text(update, "خطأ داخلي:\n" + str(e)[:500])
-        except Exception:
-            pass
+        logging.error("Unhandled error:\n" + traceback.format_exc())
+        await safe_send_text(update, "صار خطأ غير متوقع داخل البوت.")
 
-# ==== التشغيل ====
 if __name__ == "__main__":
     token = read_token()
     if not token:
-        print("ضع التوكن في token.txt أو TELEGRAM_BOT_TOKEN.")
+        print("ضع التوكن في TELEGRAM_BOT_TOKEN (متغير بيئة) أو token.txt.")
         raise SystemExit(1)
-
-    DATA_DF = load_data()
 
     app = ApplicationBuilder().token(token).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("ping", ping))
-    app.add_handler(CommandHandler("reload", reload_cmd))
     app.add_handler(CommandHandler("debug", debug_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    print("البوت يعمل... افتح تيليغرام وارسل /start")
+    print("البوت يعمل... أرسل /start على تيليغرام")
     app.run_polling()
