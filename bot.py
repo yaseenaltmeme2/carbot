@@ -1,43 +1,49 @@
-# bot.py — مقفول على مجموعة واحدة + حذف تلقائي بعد 5 دقائق
+# bot.py — نسخة كاملة مع كود DEBUG لاستخراج Chat ID
+
 import os, logging, asyncio, traceback
 from typing import List, Dict, Optional
 from openpyxl import load_workbook
-from telegram import Update, Message
+from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 from telegram.error import BadRequest, Forbidden, TimedOut, NetworkError, RetryAfter
 
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 
-# ===== إعداد القفل والزمن =====
-GROUP_ID = -1001234567890      # << بدّلها برقم مجموعتك بعد ما تستخدم /id داخل المجموعة
-AUTO_DELETE_SECONDS = 300       # مدة الحذف التلقائي بالثواني (5 دقائق)
-DELETE_BOT_MESSAGES = True      # إذا True يحذف حتى ردود البوت بعد المدة
+# ===== ضبط القفل =====
+def parse_group_id() -> int:
+    val = os.getenv("GROUP_ID", "").strip()
+    if not val:
+        return 0
+    try:
+        return int(val)
+    except:
+        return 0
+
+GROUP_ID = parse_group_id()
+DENY_MSG = "❌ هذا البوت يعمل فقط داخل المجموعة الخاصة."
+
+# ===== DEBUG لاستخراج IDs =====
+ADMIN_ID = 0  # إذا عرفت User ID مالتك حطه هنا، إذا بقي صفر رح يطبع بس باللوگ
+
+async def _capture_ids(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    c = update.effective_chat
+    try:
+        logging.info(f"[CAPTURE] ChatID={getattr(c,'id',None)} Type={getattr(c,'type',None)} "
+                     f"UserID={getattr(u,'id',None)} Username={getattr(u,'username',None)}")
+        if u and ADMIN_ID and u.id == ADMIN_ID:
+            await context.bot.send_message(
+                chat_id=u.id,
+                text=f"Chat ID: {c.id}\nUser ID: {u.id}\nChat Type: {c.type}"
+            )
+    except Exception:
+        pass
 
 def in_allowed_chat(update: Update) -> bool:
-    return bool(update.effective_chat and update.effective_chat.id == GROUP_ID)
+    return bool(update.effective_chat and GROUP_ID != 0 and update.effective_chat.id == GROUP_ID)
 
-# ===== مساعدة: جدولة حذف رسالة =====
-async def _delete_message(context: ContextTypes.DEFAULT_TYPE):
-    chat_id, msg_id = context.job.data
-    try:
-        await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
-    except Exception:
-        pass
-
-def schedule_autodelete(context: ContextTypes.DEFAULT_TYPE, msg: Optional[Message]):
-    if not msg: return
-    try:
-        # ما نحذف إذا مو بالمجموعة المقفولة
-        if msg.chat_id != GROUP_ID:
-            return
-        context.job_queue.run_once(_delete_message, AUTO_DELETE_SECONDS, data=(msg.chat_id, msg.message_id))
-    except Exception:
-        pass
-
-# ===== ملفات البيانات (إكسل) =====
+# ===== ملفات الإكسل =====
 BASE = os.path.dirname(os.path.abspath(__file__))
-
-# إذا تستخدم Persistent Disk على Render خلي DATA_DIR=/data بالـ Environment
 DATA_DIR = os.getenv("DATA_DIR", BASE)
 
 EXCEL_FILES = [
@@ -125,96 +131,65 @@ def search_plate_once(xlsx_path: str, key: str) -> Optional[Dict[str,str]]:
         logging.exception(f"خطأ أثناء قراءة {xlsx_path}: {e}")
         return None
 
-# ===== إرسال آمن + حذف ردود البوت تلقائيًا =====
-async def safe_send_text(update: Update, text: str, context: ContextTypes.DEFAULT_TYPE, max_attempts=3):
+# ===== إرسال آمن =====
+async def safe_send_text(update: Update, text: str, max_attempts=3):
     attempt = 0
-    msg = None
     while attempt < max_attempts:
         try:
-            msg = await update.message.reply_text(text)
-            break
+            return await update.message.reply_text(text)
         except RetryAfter as e:
             await asyncio.sleep(e.retry_after + 1); attempt += 1
         except (BadRequest, Forbidden, TimedOut, NetworkError):
             await asyncio.sleep(1.2); attempt += 1
-    if msg and DELETE_BOT_MESSAGES:
-        schedule_autodelete(context, msg)
-    return msg
+    try:
+        return await update.message.reply_text("تعذر الإرسال حالياً.")
+    except Exception:
+        return None
 
-async def send_in_chunks(update: Update, text: str, context: ContextTypes.DEFAULT_TYPE):
+async def send_in_chunks(update: Update, text: str):
     start, n = 0, len(text)
     while start < n:
         end = min(start + MAX_LEN, n)
-        msg = await safe_send_text(update, text[start:end], context)
+        await safe_send_text(update, text[start:end])
+        await asyncio.sleep(0.6)
         start = end
 
-# ===== أوامر (مقفولة بالتسجيل على المجموعة فقط) =====
+# ===== أوامر =====
 async def id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # مسموح فقط داخل المجموعة
-    await safe_send_text(update,
-        f"User ID: {update.effective_user.id}\nChat ID: {update.effective_chat.id}",
-        context
+    await update.message.reply_text(
+        f"User ID: {update.effective_user.id}\nChat ID: {update.effective_chat.id}\nGROUP_ID (env): {GROUP_ID}"
     )
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await safe_send_text(update,
-        "👋 أهلاً بأعضاء المجموعة.\n"
-        "أرسل رقم السيارة للبحث في السجلات.\n"
-        "أوامر: /ping /id",
-        context
-    )
+    if not in_allowed_chat(update):
+        return
+    await safe_send_text(update, "👋 أهلاً، أرسل رقم السيارة للبحث.")
 
 async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await safe_send_text(update, "pong ✅", context)
-
-async def debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    existing = [os.path.basename(f) for f in EXCEL_FILES if os.path.exists(f)]
-    msg = ["Files on server:"] + existing if existing else ["ماكو ملفات إكسل على السيرفر."]
-    await safe_send_text(update, "\n".join(msg), context)
-
-# ===== جامع الرسائل: يسجّل الحذف التلقائي لكل رسالة بالمجموعة =====
-async def collect_and_autodelete(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    أي رسالة داخل المجموعة: نسجّلها للحذف بعد AUTO_DELETE_SECONDS.
-    - نحذف رسائل الأعضاء.
-    - إذا رسالة من بوت ثاني/سيستم قد تفشل—نتجاهل الخطأ.
-    """
-    msg = update.effective_message
-    if not msg: return
-    # لا تحذف رسائل البوت مباشرةً هنا (نحذفها عبر safe_send_text حسب الإعداد)
-    if msg.from_user and msg.from_user.is_bot:
+    if not in_allowed_chat(update):
         return
-    schedule_autodelete(context, msg)
+    await safe_send_text(update, "pong ✅")
 
-# ===== البحث =====
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        text = (update.message.text or "").strip()
-        if not text:
-            await safe_send_text(update, "اكتب رقم السيارة حتى أبحث عنه.", context)
+    if not in_allowed_chat(update):
+        return
+    text = (update.message.text or "").strip()
+    if not text:
+        await safe_send_text(update, "اكتب رقم السيارة حتى أبحث عنه.")
+        return
+    key = norm(text)
+    for path in EXCEL_FILES:
+        row = search_plate_once(path, key)
+        if row:
+            msg = format_response(row, source_name=os.path.basename(path))
+            if len(msg) > MAX_LEN:
+                await send_in_chunks(update, msg)
+            else:
+                await safe_send_text(update, msg)
             return
-        key = norm(text)
+    await safe_send_text(update, f"ماكو معلومات للسيارة رقم: {text}")
 
-        for path in EXCEL_FILES:
-            row = search_plate_once(path, key)
-            if row:
-                msg = format_response(row, source_name=os.path.basename(path))
-                if len(msg) > MAX_LEN:
-                    await send_in_chunks(update, msg, context)
-                else:
-                    await safe_send_text(update, msg, context)
-                return
-
-        await safe_send_text(update, f"ماكو معلومات للسيارة رقم: {text}", context)
-
-    except (BadRequest, Forbidden, TimedOut, NetworkError, RetryAfter) as e:
-        logging.error(f"Telegram error: {type(e).__name__}: {e}")
-        await safe_send_text(update, "خطأ إرسال: جرّب بعد شوي.", context)
-    except Exception:
-        logging.error("Unhandled error:\n" + traceback.format_exc())
-        await safe_send_text(update, "صار خطأ غير متوقع داخل البوت.", context)
-
-# ===== التشغيل =====
+# ===== تشغيل البوت =====
 if __name__ == "__main__":
     token = read_token()
     if not token:
@@ -223,19 +198,15 @@ if __name__ == "__main__":
 
     app = ApplicationBuilder().token(token).build()
 
-    # ✅ تسجيـل الأوامر والنصوص *محصورة على نفس المجموعة فقط*:
-    only_group = filters.Chat(GROUP_ID)
+    # DEBUG: يطبع أي IDs
+    app.add_handler(MessageHandler(filters.ALL, _capture_ids), group=0)
 
-    app.add_handler(CommandHandler("start", start, filters=only_group))
-    app.add_handler(CommandHandler("ping", ping, filters=only_group))
-    app.add_handler(CommandHandler("id", id_cmd, filters=only_group))
-    app.add_handler(CommandHandler("debug", debug_cmd, filters=only_group))
+    app.add_handler(CommandHandler("id", id_cmd))
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("ping", ping))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # يجمع كل الرسائل داخل المجموعة لجدولة حذفها (قبل أي هاندلر ثانية)
-    app.add_handler(MessageHandler(only_group & filters.ALL, collect_and_autodelete))
-
-    # نصوص البحث داخل المجموعة فقط
-    app.add_handler(MessageHandler(only_group & (filters.TEXT & ~filters.COMMAND), handle_message))
-
-    print("البوت يعمل داخل المجموعة فقط. سيتم حذف الرسائل تلقائيًا بعد المدة المحددة.")
+    if GROUP_ID == 0:
+        logging.warning("⚠️ لم يتم ضبط GROUP_ID. أرسل أي رسالة بالمجموعة ثم شوف الـ Logs حتى تاخذ Chat ID.")
+    print("البوت يعمل. شوف الـ Logs للحصول على Chat ID إذا بعده غير مضبوط.")
     app.run_polling()
