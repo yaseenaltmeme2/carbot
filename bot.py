@@ -1,15 +1,19 @@
-# bot.py — مقفول على مجموعة واحدة فقط (لا يرد خارجها)
+# bot.py — مقفول على مجموعة واحدة + تنظيف دوري كل 5 دقائق
 import os, logging, asyncio, traceback
-from typing import List, Dict, Optional
+from collections import deque
+from typing import List, Dict, Optional, Tuple
 from openpyxl import load_workbook
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
+)
 from telegram.error import BadRequest, Forbidden, TimedOut, NetworkError, RetryAfter
 
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 
 # ===== قفل الوصول على مجموعة معيّنة =====
-GROUP_ID = -1001234567890  # <-- بدّلها برقم مجموعتك بعد ما تستخدم /id داخل المجموعة
+GROUP_ID = -1001234567890  # ← بدّلها برقم مجموعتك بعد ما تستخدم /id داخل المجموعة
+DENY_MSG = "❌ هذا البوت يعمل فقط داخل المجموعة الخاصة."
 
 def in_allowed_chat(update: Update) -> bool:
     return bool(update.effective_chat and update.effective_chat.id == GROUP_ID)
@@ -21,7 +25,6 @@ EXCEL_FILES = [
     os.path.join(BASE, "اكسل سيارات 2025.xlsx"),
 ]
 
-# أعمدة البحث/العرض
 PLATE_CANDIDATES = ["رقمها", "رقم اللوحة", "رقم السيارة", "رقم العجلة", "رقم", "الرقم", "لوحة"]
 RESPONSE_COLUMNS = ["الاسم الثلاثي", "العنوان", "الوظيفي", "مكان العمل", "لونها", "رقمها", "تسلسل الباج", "رقم الهاتف"]
 MAX_LEN = 3900
@@ -125,9 +128,45 @@ async def send_in_chunks(update: Update, text: str):
         await asyncio.sleep(0.6)
         start = end
 
+# ===== تجميع الرسائل للتنظيف الدوري =====
+# نخزن آخر عدد جيد من الرسائل (ID + chat) أثناء قدومها، ونمسحها كل 5 دقائق
+BUFFER_MAX = 2000
+messages_buffer: deque[Tuple[int, int]] = deque(maxlen=BUFFER_MAX)  # (chat_id, message_id)
+
+def buffer_message(update: Update):
+    if update.effective_chat and update.effective_message:
+        # نخزن فقط رسائل المجموعة المقفلة
+        if update.effective_chat.id == GROUP_ID and update.effective_message.message_id:
+            messages_buffer.append((update.effective_chat.id, update.effective_message.message_id))
+
+async def periodic_cleanup(context: ContextTypes.DEFAULT_TYPE):
+    """يمسح الرسائل المخزّنة منذ آخر دورة. يحتاج صلاحية Delete Messages."""
+    # ننقل المحتويات ونفرغ البافر حتى ما تتكرر
+    to_delete = []
+    while messages_buffer:
+        to_delete.append(messages_buffer.popleft())
+
+    if not to_delete:
+        return
+
+    deleted = 0
+    for chat_id, msg_id in to_delete:
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
+            deleted += 1
+            # تأخير صغير لتجنب قيود API
+            await asyncio.sleep(0.035)
+        except Exception:
+            # تجاهل أي خطأ (ممكن الرسالة قديمة جدًا أو انحذفت مسبقًا)
+            await asyncio.sleep(0.01)
+            continue
+    logging.info(f"Periodic cleanup: deleted {deleted} messages.")
+
 # ===== أوامر =====
 async def id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not in_allowed_chat(update):  # لا نرد خارج المجموعة
+    # نرد فقط داخل المجموعة
+    if not in_allowed_chat(update):
+        await update.message.reply_text(DENY_MSG)
         return
     await update.message.reply_text(
         f"User ID: {update.effective_user.id}\nChat ID: {update.effective_chat.id}"
@@ -135,7 +174,7 @@ async def id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not in_allowed_chat(update):
-        return
+        await update.message.reply_text(DENY_MSG); return
     await safe_send_text(update,
         "👋 أهلاً بأعضاء المجموعة.\n"
         "أرسل رقم السيارة للبحث في السجلات.\n"
@@ -144,22 +183,28 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not in_allowed_chat(update):
-        return
+        await update.message.reply_text(DENY_MSG); return
     await safe_send_text(update, "pong ✅")
 
-# (اختياري) فحص وجود الملفات على السيرفر
 async def debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not in_allowed_chat(update):
-        return
+        await update.message.reply_text(DENY_MSG); return
     existing = [os.path.basename(f) for f in EXCEL_FILES if os.path.exists(f)]
     msg = ["Files on server:"] + existing
     await safe_send_text(update, "\n".join(msg) if existing else "ماكو ملفات إكسل على السيرفر.")
 
-# ===== استقبال الرسائل (البحث) =====
+# ===== استقبال الرسائل (تجميع للتنظيف + البحث) =====
+async def collect_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """يجمع كل الرسائل الداخلة للمجموعة في البافر للتنظيف الدوري."""
+    if not in_allowed_chat(update):
+        return
+    buffer_message(update)
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         if not in_allowed_chat(update):
-            return  # تجاهل أي مكان غير المجموعة المحددة
+            await update.message.reply_text(DENY_MSG)
+            return
 
         text = (update.message.text or "").strip()
         if not text:
@@ -194,11 +239,21 @@ if __name__ == "__main__":
         raise SystemExit(1)
 
     app = ApplicationBuilder().token(token).build()
+
+    # أوامر
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("ping", ping))
     app.add_handler(CommandHandler("id", id_cmd))
     app.add_handler(CommandHandler("debug", debug_cmd))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    print("البوت يعمل... أرسل /start داخل المجموعة")
+    # تجميع كل الرسائل في المجموعة إلى البافر (نحطه قبل الهاندلرات الأخرى)
+    app.add_handler(MessageHandler(filters.Chat(GROUP_ID) & filters.ALL, collect_all_messages))
+
+    # نصوص فقط للبحث
+    app.add_handler(MessageHandler(filters.Chat(GROUP_ID) & (filters.TEXT & ~filters.COMMAND), handle_message))
+
+    # جدولة تنظيف كل 5 دقائق
+    app.job_queue.run_repeating(periodic_cleanup, interval=300, first=60)
+
+    print("البوت يعمل... داخل المجموعة فقط. سيتم تنظيف الرسائل كل 5 دقائق.")
     app.run_polling()
