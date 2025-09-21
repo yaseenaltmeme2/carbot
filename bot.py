@@ -16,7 +16,7 @@ def in_allowed_chat(update: Update) -> bool:
     return bool(update.effective_chat and GROUP_ID != 0 and update.effective_chat.id == GROUP_ID)
 
 # ===== الحذف التلقائي (اختياري) =====
-AUTO_DELETE_SECONDS = 0        # 0 = معطّل. خليه 300 حتى يحذف بعد 5 دقائق
+AUTO_DELETE_SECONDS = 300        # 0 = معطّل. خليه 300 حتى يحذف بعد 5 دقائق
 DELETE_BOT_MESSAGES = True     # إذا True يحذف حتى ردود البوت بعد المدة
 
 async def _delete_job(context: ContextTypes.DEFAULT_TYPE):
@@ -221,3 +221,4 @@ if __name__ == "__main__":
 
     print("البوت يعمل… مقفول على المجموعة المحددة بـ GROUP_ID.")
     app.run_polling()
+
